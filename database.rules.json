@@ -1,0 +1,31 @@
+{
+  "rules": {
+    "rooms": {
+      "$code": {
+        ".read": "auth != null",
+        ".write": "auth != null && (!data.exists() || data.child('players/host/uid').val() === auth.uid || data.child('players/guest/uid').val() === auth.uid)",
+        "players": {
+          "host": {
+            ".validate": "newData.child('uid').val() === auth.uid && newData.child('name').isString() && newData.child('name').val().length > 0 && newData.child('name').val().length <= 12"
+          },
+          "guest": {
+            ".write": "auth != null && (!data.exists() || data.child('uid').val() === auth.uid)",
+            ".validate": "newData.child('uid').val() === auth.uid && newData.child('name').isString() && newData.child('name').val().length > 0 && newData.child('name').val().length <= 12"
+          }
+        },
+        "customQuestions": {
+          "$id": {
+            ".validate": "newData.child('text').isString() && newData.child('text').val().length > 0 && newData.child('text').val().length <= 60"
+          }
+        },
+        "answers": {
+          "$q": {
+            "$role": {
+              ".validate": "($role === 'host' || $role === 'guest') && newData.child('self').isString() && newData.child('guess').isString() && newData.child('self').val().length <= 60 && newData.child('guess').val().length <= 60"
+            }
+          }
+        }
+      }
+    }
+  }
+}
