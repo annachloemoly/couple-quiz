@@ -33,7 +33,13 @@ const otherRole = (r) => (r === "host" ? "guest" : "host");
 const genCode = () =>
   Array.from({ length: 6 }, () => CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]).join("");
 const nameOf = (role) => state.room?.players?.[role]?.name || (role === "host" ? "방장" : "상대");
-const getQuestions = (room) => (room.questions ? Object.values(room.questions) : []);
+// 질문은 { text, options? } 형태로 통일한다. options가 있으면 선택형, 없으면 자유 입력.
+const normQuestion = (q) => {
+  if (typeof q === "string") return { text: q };
+  const options = q.options ? Object.values(q.options).filter(Boolean) : [];
+  return options.length >= 2 ? { text: q.text, options } : { text: q.text };
+};
+const getQuestions = (room) => (room.questions ? Object.values(room.questions).map(normQuestion) : []);
 const roomRef = (path = "") => ref(state.db, `rooms/${state.code}${path ? "/" + path : ""}`);
 
 let toastTimer;
@@ -202,14 +208,16 @@ async function joinRoom(rawCode, name) {
 
 async function startGame() {
   const room = state.room;
-  const customs = shuffle(Object.values(room.customQuestions || {}).map((c) => c.text)).slice(0, TOTAL_QUESTIONS);
-  const defaults = shuffle(DEFAULT_QUESTIONS).slice(0, TOTAL_QUESTIONS - customs.length);
+  const customs = shuffle(Object.values(room.customQuestions || {}).map(normQuestion)).slice(0, TOTAL_QUESTIONS);
+  const defaults = shuffle(DEFAULT_QUESTIONS.map(normQuestion)).slice(0, TOTAL_QUESTIONS - customs.length);
   const questions = shuffle([...customs, ...defaults]);
   await update(roomRef(), { questions, current: 0, status: "playing" });
 }
 
-async function addCustomQuestion(text) {
-  await push(roomRef("customQuestions"), { text, by: state.role });
+async function addCustomQuestion(text, options = []) {
+  const data = { text, by: state.role };
+  if (options.length >= 2) data.options = options; // Firebase는 undefined 값을 저장할 수 없어서 있을 때만 넣는다.
+  await push(roomRef("customQuestions"), data);
 }
 
 async function setVerdict(q, guesser, value) {
@@ -239,27 +247,31 @@ function outcome(room, q, guesser) {
   const owner = otherRole(guesser);
   if (!a?.[guesser] || !a?.[owner]) return null;
 
+  const choice = !!getQuestions(room)[q]?.options; // 선택형 여부
   const guess = a[guesser].guess;
   const truth = a[owner].self;
-  const res = judge(guess, truth); // correct | maybe | wrong
+  // 선택형은 선택지가 같은지만 보고, 자유 입력은 정규화·오타 허용으로 먼저 판정한다.
+  const res = choice ? (guess === truth ? "correct" : "wrong") : judge(guess, truth); // correct | maybe | wrong
   const verdict = room.verdicts?.[q]?.[guesser]; // 진짜 답 주인이 내린 판정: "yes" | "no" | undefined
 
   let st;
-  if (res === "correct" || verdict === "yes") st = "ok";
-  else if (res === "maybe" && verdict === undefined) st = "pending";
-  else st = "no";
+  if (res === "correct") st = "ok";
+  else if (choice) st = "no";
+  else if (verdict === "yes") st = "ok";
+  else if (verdict === "no") st = "no";
+  else st = "pending"; // 자유 입력인데 자동으로 맞지 않으면 답 주인이 판정할 때까지 대기
 
-  return { guess, truth, res, verdict, state: st, owner };
+  return { guess, truth, res, verdict, state: st, owner, choice };
 }
 
 function computeScores(room) {
   const score = { host: 0, guest: 0 };
-  const rows = getQuestions(room).map((text, q) => {
+  const rows = getQuestions(room).map((qo, q) => {
     const h = outcome(room, q, "host");
     const g = outcome(room, q, "guest");
     if (h?.state === "ok") score.host++;
     if (g?.state === "ok") score.guest++;
-    return { text, h, g };
+    return { text: qo.text, h, g };
   });
   return { score, rows };
 }
@@ -278,17 +290,17 @@ function render() {
     key = "final"; mount = mountFinal;
   } else {
     const q = room.current ?? 0;
-    const text = qs[q];
+    const qo = qs[q];
     const a = room.answers?.[q] || {};
     const mine = !!a[state.role];
     const theirs = !!a[otherRole(state.role)];
     if (!mine) {
-      key = `q${q}-answer`; mount = () => mountAnswer(q, text); update = () => updateStatus(q);
+      key = `q${q}-answer`; mount = () => mountAnswer(q, qo); update = () => updateStatus(q);
     } else if (!theirs) {
-      key = `q${q}-wait`; mount = () => mountWait(q, text); update = () => updateStatus(q);
+      key = `q${q}-wait`; mount = () => mountWait(q, qo.text); update = () => updateStatus(q);
     } else {
       key = `q${q}-reveal-${JSON.stringify(room.verdicts?.[q] || {})}`;
-      mount = () => mountReveal(q, text);
+      mount = () => mountReveal(q, qo.text);
     }
   }
 
@@ -374,10 +386,11 @@ function mountLobby() {
     <ul class="list" id="players"></ul>
 
     <h3>우리만의 질문 추가 <small class="muted">(선택)</small></h3>
-    <p class="hint">"처음 데이트한 곳은?"처럼 써주세요. 기본 질문과 섞여 총 ${TOTAL_QUESTIONS}문제가 나와요.</p>
-    <form id="qForm" class="row">
+    <p class="hint">"처음 데이트한 곳은?"처럼 써주세요. 기본 질문과 섞여 총 ${TOTAL_QUESTIONS}문제가 나와요. 선택지를 적으면 객관식, 비우면 직접 입력 질문이 돼요.</p>
+    <form id="qForm">
       <input id="qInput" type="text" maxlength="60" autocomplete="off" placeholder="둘만 아는 질문을 적어보세요">
-      <button type="submit">추가</button>
+      <input id="optInput" type="text" maxlength="100" autocomplete="off" placeholder="선택지 (선택) 예: 바다, 산, 도시" style="margin-top:8px">
+      <button type="submit" class="primary" style="margin-top:8px">질문 추가</button>
     </form>
     <ul class="list" id="customList"></ul>
 
@@ -388,13 +401,20 @@ function mountLobby() {
   document.getElementById("qForm").addEventListener("submit", async (e) => {
     e.preventDefault();
     const input = document.getElementById("qInput");
+    const optInput = document.getElementById("optInput");
     const text = input.value.trim();
     if (!text) return;
+    const rawOpts = optInput.value;
+    const options = [...new Set(rawOpts.split(/[,，]/).map((s) => s.trim()).filter(Boolean))].slice(0, 6);
+    if (rawOpts.trim() && options.length < 2) return toast("선택지는 쉼표(,)로 구분해서 2개 이상 적어주세요.");
+    if (options.some((o) => o.length > 20)) return toast("선택지는 20자 이하로 적어주세요.");
     input.value = "";
+    optInput.value = "";
     try {
-      await addCustomQuestion(text);
+      await addCustomQuestion(text, options);
     } catch (err) {
       input.value = text;
+      optInput.value = rawOpts;
       showError(err);
     }
   });
@@ -417,7 +437,7 @@ function updateLobby() {
     ? customs
         .map(
           ([id, c]) => `<li>
-            <span>${esc(c.text)} <small class="muted">— ${esc(nameOf(c.by))}</small></span>
+            <span>${esc(c.text)}${c.options ? ` <small class="muted">[${esc(Object.values(c.options).join(" / "))}]</small>` : ""} <small class="muted">— ${esc(nameOf(c.by))}</small></span>
             ${c.by === state.role ? `<button class="x" data-del="${esc(id)}" aria-label="삭제">✕</button>` : ""}
           </li>`
         )
@@ -433,28 +453,47 @@ function updateLobby() {
 
 /* ---- 문제: 답 입력 ---- */
 
-function mountAnswer(q, text) {
+function mountAnswer(q, qo) {
   const total = getQuestions(state.room).length;
   const them = nameOf(otherRole(state.role));
+  const isChoice = !!qo.options;
+
+  const optsHtml = (name) =>
+    `<div class="opts">${qo.options
+      .map((o) => `<label class="opt"><input type="radio" name="${name}" value="${esc(o)}"><span>${esc(o)}</span></label>`)
+      .join("")}</div>`;
+
+  const fields = isChoice
+    ? `<div class="field-label">나는 (내 진짜 답)</div>
+       ${optsHtml("self")}
+       <div class="field-label">${esc(them)}의 답은 아마 (맞혀보기)</div>
+       ${optsHtml("guess")}`
+    : `<label for="selfInput">나는 (내 진짜 답)</label>
+       <input id="selfInput" type="text" maxlength="40" autocomplete="off">
+       <label for="guessInput">${esc(them)}의 답은 아마 (맞혀보기)</label>
+       <input id="guessInput" type="text" maxlength="40" autocomplete="off">`;
+
   app.innerHTML = `<section class="card">
-    <div class="progress">${q + 1} / ${total}</div>
-    <h2 class="qtext">${esc(text)}</h2>
+    <div class="progress">${q + 1} / ${total}${isChoice ? " · 객관식" : ""}</div>
+    <h2 class="qtext">${esc(qo.text)}</h2>
     <form id="aForm">
-      <label for="selfInput">나는 (내 진짜 답)</label>
-      <input id="selfInput" type="text" maxlength="40" autocomplete="off">
-      <label for="guessInput">${esc(them)}의 답은 아마 (맞혀보기)</label>
-      <input id="guessInput" type="text" maxlength="40" autocomplete="off">
+      ${fields}
       <button class="primary" type="submit">제출</button>
     </form>
     <p class="hint" id="partnerStatus"></p>
   </section>`;
 
   const form = document.getElementById("aForm");
+  const read = (name) =>
+    isChoice
+      ? form.querySelector(`input[name="${name}"]:checked`)?.value || ""
+      : document.getElementById(name === "self" ? "selfInput" : "guessInput").value.trim();
+
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
-    const self = document.getElementById("selfInput").value.trim();
-    const guess = document.getElementById("guessInput").value.trim();
-    if (!self || !guess) return toast("두 칸 모두 입력해주세요.");
+    const self = read("self");
+    const guess = read("guess");
+    if (!self || !guess) return toast(isChoice ? "두 가지 모두 골라주세요." : "두 칸 모두 입력해주세요.");
     const btn = form.querySelector("button");
     btn.disabled = true;
     try {
@@ -464,7 +503,7 @@ function mountAnswer(q, text) {
       showError(err);
     }
   });
-  document.getElementById("selfInput").focus();
+  if (!isChoice) document.getElementById("selfInput").focus();
 }
 
 function mountWait(q, text) {
@@ -497,16 +536,20 @@ function dirCard(q, guesser) {
   const btn = (val, text, cls = "") =>
     `<button class="${cls}" data-act="verdict" data-q="${q}" data-who="${guesser}" data-val="${val}">${text}</button>`;
 
+  // 자유 입력인데 자동으로 맞지 않은 답은 진짜 답을 쓴 사람이 직접 판정한다.
   let actions = "";
-  if (isOwner && o.res !== "correct") {
-    if (o.res === "maybe" && o.verdict === undefined) {
-      actions = `<p class="hint">비슷해 보여요! 같은 답으로 쳐줄까요?</p>
-        <div class="actions">${btn("yes", "같은 걸로 인정 ✅")}${btn("no", "다른 거야 ❌", "ghost")}</div>`;
-    } else if (o.verdict !== "yes") {
-      actions = `<div class="actions">${btn("yes", "그래도 인정하기", "ghost")}</div>`;
+  if (!o.choice && o.res !== "correct") {
+    if (isOwner) {
+      if (o.verdict === undefined) {
+        const hint = o.res === "maybe" ? "비슷해 보여요! 같은 답으로 쳐줄까요?" : "상대의 추측을 정답으로 쳐줄까요?";
+        actions = `<p class="hint">${hint}</p>
+          <div class="actions">${btn("yes", "정답으로 인정 ✅")}${btn("no", "오답 ❌", "ghost")}</div>`;
+      } else {
+        actions = `<div class="actions">${btn(o.verdict === "yes" ? "no" : "yes", "판정 바꾸기", "ghost")}</div>`;
+      }
+    } else if (o.verdict === undefined) {
+      actions = `<p class="hint">${esc(nameOf(o.owner))}님이 판정 중이에요…</p>`;
     }
-  } else if (o.state === "pending") {
-    actions = `<p class="hint">${esc(nameOf(o.owner))}님이 판정 중이에요…</p>`;
   }
 
   return `<div class="dir ${o.state}">
